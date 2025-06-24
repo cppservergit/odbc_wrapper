@@ -1,0 +1,10 @@
+# Compiled files
+*.o
+*.exe
+*.a
+
+# Executable
+run_tests
+
+# Doxygen documentation
+docs/
