@@ -8,15 +8,11 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
-#include <iostream>
 #include <format>
-#include <cstdint> // For uintptr_t
 
-// Platform-specific ODBC and thread includes
+// Platform-specific ODBC includes
 #ifdef _WIN32
-#include <Windows.h>
-#else
-#include <pthread.h>
+#include <windows.h>
 #endif
 #include <sql.h>
 #include <sqlext.h>
@@ -203,25 +199,9 @@ inline Connection::Connection(const Environment& env) {
 }
 
 inline Connection::~Connection() noexcept {
-    try {
-        if (m_handle != nullptr) {
-            #ifdef _WIN32
-                const auto thread_id = static_cast<uintptr_t>(GetCurrentThreadId());
-            #else
-                const auto thread_id = reinterpret_cast<uintptr_t>(pthread_self());
-            #endif
-            std::cerr << std::format("[Thread 0x{:x}] Closing connection via destructor.\n", thread_id);
-            
-            SQLDisconnect(m_handle);
-            SQLFreeHandle(SQL_HANDLE_DBC, m_handle);
-        }
-    } catch (...) {
-        #ifdef _WIN32
-            const auto thread_id = static_cast<uintptr_t>(GetCurrentThreadId());
-        #else
-            const auto thread_id = reinterpret_cast<uintptr_t>(pthread_self());
-        #endif
-        std::cerr << std::format("[Thread 0x{:x}] WARNING: Exception caught and suppressed in Connection destructor.\n", thread_id);
+    if (m_handle != nullptr) {
+        SQLDisconnect(m_handle);
+        SQLFreeHandle(SQL_HANDLE_DBC, m_handle);
     }
 }
 
@@ -250,25 +230,11 @@ inline std::expected<void, OdbcError> Connection::driver_connect(std::string_vie
         return std::unexpected(get_diagnostic_record(m_handle, SQL_HANDLE_DBC)
             .value_or(OdbcError{"HY000", 0, "Unknown connection error via DriverConnect"}));
     }
-
-    #ifdef _WIN32
-        const auto thread_id = static_cast<uintptr_t>(GetCurrentThreadId());
-    #else
-        const auto thread_id = reinterpret_cast<uintptr_t>(pthread_self());
-    #endif
-    std::cerr << std::format("[Thread 0x{:x}] Connection established successfully.\n", thread_id);
     
     return {};
 }
 
 inline std::expected<void, OdbcError> Connection::disconnect() {
-    #ifdef _WIN32
-        const auto thread_id = static_cast<uintptr_t>(GetCurrentThreadId());
-    #else
-        const auto thread_id = reinterpret_cast<uintptr_t>(pthread_self());
-    #endif
-    std::cerr << std::format("[Thread 0x{:x}] Explicitly disconnecting connection.\n", thread_id);
-    
     if (SQLRETURN ret = SQLDisconnect(m_handle); !SQL_SUCCEEDED(ret)) {
         return std::unexpected(get_diagnostic_record(m_handle, SQL_HANDLE_DBC)
             .value_or(OdbcError{"HY000", 0, "Unknown disconnection error"}));
@@ -325,7 +291,7 @@ inline std::expected<SQLLEN, OdbcError> Statement::row_count() {
 
 
 inline std::expected<bool, OdbcError> Statement::fetch() {
-    if (SQLRETURN ret = SQLFetch(m_handle); SQL_SUCCEEDED(ret)) {
+    if (SQLRETURN ret = SQLFetch(m_handle); ret == SQL_SUCCESS || ret == SQL_SUCCESS_WITH_INFO) {
         return true;
     } else if (ret == SQL_NO_DATA) {
         return false;
@@ -343,27 +309,31 @@ namespace detail {
         std::vector<char> buffer(1024);
         SQLLEN indicator = 0;
         
-        SQLRETURN ret = SQLGetData(hstmt, column_index, SQL_C_CHAR, buffer.data(), buffer.size(), &indicator);
-
-        // Check if the buffer was too small and resize if necessary.
-        if (ret == SQL_SUCCESS_WITH_INFO && indicator > static_cast<SQLLEN>(buffer.size() - 1)) {
+        // First attempt to get the data
+        if (SQLRETURN ret = SQLGetData(hstmt, column_index, SQL_C_CHAR, buffer.data(), buffer.size(), &indicator);
+            ret == SQL_SUCCESS_WITH_INFO && indicator > static_cast<SQLLEN>(buffer.size() - 1)) 
+        {
+            // Buffer was too small, resize and try again.
             buffer.resize(static_cast<size_t>(indicator) + 1);
-            ret = SQLGetData(hstmt, column_index, SQL_C_CHAR, buffer.data(), buffer.size(), &indicator);
-        }
-        
-        // After potential resize, check for final failure.
-        if (!SQL_SUCCEEDED(ret)) {
-            if (indicator == SQL_NULL_DATA) {
-                return std::optional<std::string>(std::nullopt);
+            if (SQLRETURN ret2 = SQLGetData(hstmt, column_index, SQL_C_CHAR, buffer.data(), buffer.size(), &indicator);
+                !SQL_SUCCEEDED(ret2)) 
+            {
+                // The second attempt failed.
+                return std::unexpected(get_diagnostic_record(hstmt, SQL_HANDLE_STMT).value_or(OdbcError{"HY000", 0, "Unknown GetData<string> error after resize"}));
             }
+        } 
+        else if (!SQL_SUCCEEDED(ret)) 
+        {
+            // First attempt failed for a reason other than small buffer.
+            if (indicator == SQL_NULL_DATA) return std::optional<std::string>(std::nullopt);
             return std::unexpected(get_diagnostic_record(hstmt, SQL_HANDLE_STMT).value_or(OdbcError{"HY000", 0, "Unknown GetData<string> error"}));
         }
-        
-        // Check for NULL data on success.
+
+        // At this point, the data is successfully in the buffer.
         if (indicator == SQL_NULL_DATA) {
             return std::optional<std::string>(std::nullopt);
         }
-        
+            
         std::string str_value;
         if (indicator > 0) {
             str_value.assign(buffer.data(), static_cast<size_t>(indicator));
