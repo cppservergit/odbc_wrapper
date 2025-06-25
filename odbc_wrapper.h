@@ -12,7 +12,7 @@
 
 // Platform-specific ODBC includes
 #ifdef _WIN32
-#include <windows.h>
+#include <Windows.h>
 #endif
 #include <sql.h>
 #include <sqlext.h>
